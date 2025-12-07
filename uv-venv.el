@@ -18,6 +18,7 @@
 ;; along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 ;;; Code:
+;;; uv-venv.el --- UV manager with Auto-LSP, Tooltips, and Package Management -*- lexical-binding: t; -*-
 
 (require 'project)
 (require 'python)
@@ -27,7 +28,7 @@
 
 (defcustom uv-venv-command "uv" "Executable for uv." :type 'string :group 'uv-venv)
 (defcustom uv-venv-folder-name ".venv" "Default venv folder." :type 'string :group 'uv-venv)
-(defcustom uv-venv-lsp-server "basedpyright" 
+(defcustom uv-venv-lsp-server "pyright" 
   "The LSP package to install (e.g. basedpyright, pyright, python-lsp-server)."
   :type 'string :group 'uv-venv)
 
@@ -49,14 +50,31 @@
         (setq uv-venv-current-name 
               (propertize (format " [uv:%s]" (file-name-nondirectory venv-path))
                           'face 'font-lock-string-face
-                          ;; Tooltip content:
                           'help-echo (format "Active venv: %s" venv-path)
-                          ;; Visual highlight on hover:
                           'mouse-face 'mode-line-highlight)))
     (setq uv-venv-current-name ""))
   (force-mode-line-update t))
 
-;;; --- Core Logic ---
+(defun uv-venv--start-eglot ()
+  "Safely restart Eglot to pick up the new environment."
+  (when (derived-mode-p 'python-mode)
+    (if (and (fboundp 'eglot-managed-p) (eglot-managed-p))
+        ;; If already running, reconnect the SPECIFIC server instance
+        (eglot-reconnect (eglot-current-server))
+      ;; Otherwise, just ensure it starts
+      (eglot-ensure))))
+
+(defun uv-venv--ensure-lsp (venv-path)
+  "Check if LSP is installed in VENV-PATH, install if missing."
+  (let* ((bin-dir (uv-venv--bin-dir venv-path))
+         (lsp-exe (expand-file-name uv-venv-lsp-server bin-dir)))
+    
+    (if (file-exists-p lsp-exe)
+        (uv-venv--start-eglot)
+      (when (y-or-n-p (format "LSP (%s) missing in venv. Install it now? " uv-venv-lsp-server))
+        (uv-venv-install-lsp venv-path)))))
+
+;;; --- Public Commands ---
 
 ;;;###autoload
 (defun uv-venv-create (python-version)
@@ -92,7 +110,7 @@
     (let* ((bin-dir (uv-venv--bin-dir venv-path))
            (python-exe (expand-file-name "python" bin-dir)))
 
-      ;; 1. Set Emacs Environment
+      ;; Set Emacs Environment
       (setq python-shell-interpreter python-exe)
       (setq python-shell-virtualenv-root venv-path)
       (setenv "VIRTUAL_ENV" venv-path)
@@ -102,19 +120,10 @@
       (uv-venv--update-modeline)
       (message "Activated: %s" (file-name-nondirectory venv-path))
 
-      ;; 2. Check for LSP and Install if missing
+      ;; Check for LSP
       (uv-venv--ensure-lsp venv-path))))
 
-(defun uv-venv--ensure-lsp (venv-path)
-  "Check if LSP is installed in VENV-PATH, install if missing."
-  (let* ((bin-dir (uv-venv--bin-dir venv-path))
-         (lsp-exe (expand-file-name uv-venv-lsp-server bin-dir)))
-    
-    (if (file-exists-p lsp-exe)
-        (uv-venv--start-eglot)
-      (when (y-or-n-p (format "LSP (%s) missing in venv. Install it now? " uv-venv-lsp-server))
-        (uv-venv-install-lsp venv-path)))))
-
+;;;###autoload
 (defun uv-venv-install-lsp (venv-path)
   "Install the configured LSP server into VENV-PATH using uv pip."
   (message "Installing %s..." uv-venv-lsp-server)
@@ -129,12 +138,34 @@
                      (uv-venv--start-eglot))
                  (message "LSP installation failed. Check *uv-lsp-install*.")))))
 
-(defun uv-venv--start-eglot ()
-  "Restart Eglot to pick up the new environment."
-  (when (derived-mode-p 'python-mode)
-    (if (fboundp 'eglot-reconnect)
-        (eglot-reconnect)
-      (eglot-ensure))))
+;;;###autoload
+(defun uv-add (package)
+  "Install a PACKAGE into the current active venv using uv."
+  (interactive "sPackage to install: ")
+  (if (not (getenv "VIRTUAL_ENV"))
+      (user-error "No uv environment active. Activate one first.")
+    (message "Installing %s..." package)
+    (make-process
+     :name "uv-add"
+     :buffer "*uv-add*"
+     :command (list uv-venv-command "pip" "install" package)
+     :sentinel (lambda (_ event)
+                 (if (string= event "finished\n")
+                     (message "Installed %s successfully." package)
+                   (message "Failed to install %s." package))))))
+
+;;;###autoload
+(defun uv-venv-init-pyright ()
+  "Create a default pyrightconfig.json to ignore the venv directory."
+  (interactive)
+  (let ((config-file (expand-file-name "pyrightconfig.json" (uv-venv--get-project-root)))
+        (venv-name uv-venv-folder-name))
+    (if (file-exists-p config-file)
+        (message "pyrightconfig.json already exists.")
+      (with-temp-file config-file
+        (insert (format "{\n  \"venvPath\": \".\",\n  \"venv\": \"%s\",\n  \"exclude\": [\"**/%s\"]\n}"
+                        venv-name venv-name)))
+      (message "Created pyrightconfig.json configured for %s" venv-name))))
 
 ;;;###autoload
 (defun uv-venv-deactivate ()
